@@ -298,10 +298,11 @@
 
     erfc(x) for fp32mp2:
       erfc(x) = erfcx(|x|)*exp(-x^2).
-      Core: erfcx approximated by a degree-22 Chebyshev polynomial in
-      the transformed variable t = 1/(1+|x|), combined with a dedicated
-      exp(-x^2) evaluation using a degree-8 polynomial, all in fp32mp2.
+      Core: erfcx(|x|) = s*R(s - 9/16) with s = 4/(|x|+4), from one reciprocal
+      and a degree-18 minimax polynomial R, combined with a dedicated
+      exp(-x^2) evaluation using a degree-11 polynomial, all in fp32mp2.
       Uses the identity erfc(-x) = 2 - erfc(x) for negative arguments.
+      The result is 0 (or 2) for |x| > 10.0546875, where erfc(|x|) < 2^-150.
 
     normcdfinv(p) for fp32mp2:
       Rational approximation (Mike Giles coefficients).
