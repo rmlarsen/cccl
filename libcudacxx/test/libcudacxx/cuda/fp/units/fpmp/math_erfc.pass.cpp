@@ -8,11 +8,11 @@
 //===----------------------------------------------------------------------===//
 //
 //  Unit test: fp32mp2 erfc across its kernel: small arguments, where the result
-//  is close to 1 and an earlier kernel erred by up to 76u^2 (u = 2^-24); the
-//  rest of the range with a normal result, both signs; results in the
-//  subnormal range; and the arguments from which the result is exactly 0 or 2.
-//  A normal result must lie within 16u^2 of an MPFR reference, held as a double
-//  pair, and a subnormal one within two units of 2^-149.
+//  is close to 1; the rest of the range up to |x| = 8.2, both signs, where
+//  erfc(x) > 2^-101 and so the pair still resolves u^2 (u = 2^-24) of the
+//  result; results in the subnormal range; and the arguments from which the
+//  result is exactly 0 or 2. Up to |x| = 8.2 a result must lie within 16u^2 of
+//  an MPFR reference, held as a double pair, and a subnormal one within 2^-148.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,7 +31,7 @@ struct erfc_case
   double ref_lo;
 };
 
-// r - ref. r.hi() - ref_hi is exact, as the two are within a factor of 2 (or both
+// |r - ref|. r.hi() - ref_hi is exact, as the two are within a factor of 2 (or both
 // subnormal), so the measurement itself errs by about 2^-53 of the reference.
 TEST_HOST_DEVICE_FUNC double abs_err(cuda::fp32mp2 r, erfc_case c)
 {
