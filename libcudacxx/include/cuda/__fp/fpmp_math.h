@@ -166,77 +166,42 @@
 
     Dedicated Implementation Details:
     -------------------------------------------------------------------------
-    exp(x) for fp32mp2:
-      Argument reduction: x = n*ln2 + r, |r| < ln2/2.
-      Core: 14-term Taylor series for exp(r) in fp32mp2.
-      Reconstruction: result * 2^n via IEEE-754 exponent manipulation.
-      Accuracy: ~10^-10 - 10^-11 relative error.
+    exp(x), exp2(x), exp10(x), expm1(x) for fp32mp2:
+      Table driven, on the tables of pow. x is reduced exactly to a
+      multiple k of ln2/128 (of 1/128 for exp2, of log10(2)/128 for
+      exp10) plus a pair phi, |phi| <= ln2/256, by a three-part
+      Cody-Waite step whose leading constant has 9 bits, so that the
+      error does not grow with |x|:
+        b^x = 2^n * 2^(j/128) * e^phi,   k = 128 n + j
+      2^(j/128) comes from a 128-entry table and e^phi - 1 from a
+      degree-5 polynomial; the scaling by 2^n is applied in two steps,
+      so that a subnormal result is rounded once.  exp2 of an integer
+      is the exact power of two.
+      expm1 takes j from [-64, 63], 2^(j/128) - 1 from a table of its
+      own and e^phi - 1 to full relative accuracy, and returns
+      (2^n - 1) + 2^n (2^(j/128) e^phi - 1); the sum is the result
+      itself for |x| < 0.35, where n = 0.
+      Accuracy against MPFR: within 3.2u^2 (u = 2^-24), 4.1u^2 for expm1.
+      Special cases: NaN->NaN, overflow->+inf, underflow->+0 (-1 for
+      expm1), expm1(+-0) = +-0.
 
-    log(x) for fp32mp2:
-      Range reduction: x = m*2^e, m  in  [1, sqrt2).
-      Core: log(m) = 2*atanh((m-1)/(m+1)) via degree-8 minimax polynomial.
-      Reconstruction: log(x) = log(m) + e*ln2 with fp32mp2 ln2 constant.
-      Handles denormals via pre-scaling.
-
-    log1p(x) for fp32mp2:
-      Forwards to log(1+x) after computing 1+x via fp32mp2 2-sum, which
-      preserves the small-x lo (the lo carries x exactly when |x| <= 1
-      causes float hi cancellation).  log()'s accurate sub for (m-1)
-      then recovers full fp32mp2 precision in the asinh-form Horner
-      core, yielding the a - a^2/2 + a^3/3 - ... expansion implicitly.
-      Special cases (x = -1 -> -inf, x < -1 -> NaN, +-inf) handled
-      explicitly before forwarding.
-
-    log2(x), log10(x) for fp32mp2:
-      Composition over the dedicated fp32mp2 natural log:
-        log2(x)  = log(x) * (1/ln 2)
-        log10(x) = log(x) * (1/ln 10)
-      with the reciprocal stored as a single fp32mp2 (hi+lo) constant.
-      The one ff-multiply costs ~1 ulp on the lo limb; combined with
-      the ~46-bit precision of __fpmp2_log this still leaves >44
-      bits of accuracy across the whole representable input range,
-      matching the fp32mp2 noise floor.  All domain special cases
-      (x<=0, +-inf, NaN) are handled inside __fpmp2_log.
-
-    exp2(x), exp10(x) for fp32mp2:
-      Dedicated implementations following a "single base-2
-      split" strategy.  Pseudocode:
-        t      = x * log2(base)        [exp2: t = x; exp10: t = x * log2 10]
-        n      = round(t.hi)           [exact integer = binary exponent]
-        r      = t - n                 [|r.hi| <= 0.5]
-        2^r    via the inlined base-2 Taylor kernel
-               `__internal_fpmp2_exp2_kernel` with coefficients
-               a_k = (ln 2)^k / k!     [no r * ln 2 detour, no
-                                        natural-log reduction inside]
-        result = 2^n * 2^r             [via split-exponent helper]
-      The single integer split happens in *base-2* units, so the 2^n
-      factor drops out exactly and the kernel never touches a value
-      outside [-0.5, 0.5].  Compared to the earlier composition
-      exp(x * ln base) -- which forced __fpmp2_exp to re-derive
-      n_internal from the already-amplified product, stacking two
-      reduction errors -- the dedicated path keeps only one __ffloat
-      multiplication on the input side (and zero for exp2).  Net:
-      `exp2` matches the composed path within 1 bit on the `work`
-      dataset while cutting fp32mp2 call cost; `exp10` matches the
-      composed path's 39-bit `work` accuracy at lower instruction
-      count.  Overflow / underflow shortcuts (|x| at the float
-      exponent boundary) avoid the wasted polynomial / scaling work
-      when the result is already a rounded +-inf / 0.
-
-    expm1(x) for fp32mp2:
-      Strategy mirrors log1p:
-        |x_hi| < 1/2:  direct Taylor series
-                       expm1(x) = x + x^2 * (1/2 + x/6 + x^2/24 + ...)
-                       evaluated as 12 mixed-precision Horner terms
-                       (M = 4 split, top 4 plain float, bottom 8 ff).
-        |x_hi| >= 1/2: exp(x) - 1 via fp32mp2 accurate sub against
-                       the constant 1.0; the subtraction loses <= 1
-                       bit because |exp(x) - 1| >= 0.4 in this band.
-      The polynomial branch covers ~25 % of a normal-around-0 input
-      distribution; warp divergence cost stays modest.  Truncation
-      noise at the branch point: omitted x^13 term ~= 0.5^13/13!
-      ~= 1.96*10^-14, well below fp32mp2 ulp at expm1(1/2).
-      Special cases: NaN->NaN, +inf->+inf, -inf->-1, x=0->0.
+    log(x), log2(x), log10(x), log1p(x) for fp32mp2:
+      Table driven, on the table of pow. x = 2^k z with z in
+      [0.701, 1.402); the bucket holding z, one of 128, gives 1/c with
+      9 bits, so that r = z/c - 1 is exact, and ln(c) as three floats:
+        ln(x) = k ln2 + ln(c) + r + r^2 (-1/2 + r P(r)),   |r| < 2^-7.5
+      The bucket around 1 has c = 1, which keeps the result relatively
+      accurate as x -> 1.  No division is involved.
+      log2 and log10 scale ln(z) and add k, or k log10(2), afterwards;
+      log2 of a power of two is exact.  log1p forms r from x itself
+      where 1 + x is in [0.701, 1.402), so that the result keeps the
+      relative accuracy of x as x -> 0, and otherwise takes the
+      logarithm of the pair 1 + x.
+      Accuracy against MPFR: within 5u^2 for log, 6u^2 for log2 and
+      log10, 9u^2 for log1p.
+      Special cases: NaN->NaN, +-0->-inf, x<0->NaN, +inf->+inf;
+      subnormal x is scaled into the normal range; log1p(-1) = -inf,
+      log1p(x < -1) = NaN, log1p(+-0) = +-0.
 
     asinh(x), acosh(x), atanh(x) for fp32mp2:
       Inverse hyperbolic family -- all three reduce to a single log1p
