@@ -46,19 +46,22 @@ _CCCL_BEGIN_NAMESPACE_CUDA
  * Internal kernels for sin, cos and sincos (fp32mp2)
  * ====================================================================
  * Algorithm:
- *   1. Argument reduction: x = n*(pi/2) + r, |r| <= pi/4
+ *   1. Argument reduction: x = n*(pi/2) + r
  *      - Tiny (|x| < pi/4): no reduction
- *      - Fast (|x| < 2^20): Cody-Waite with exact error tracking
- *        via two_mult_fma + two_sum (4-piece pi/2, within 8.5e-32)
+ *      - Fast (|x| < 2^20): Cody-Waite with a 4-piece pi/2 (within 8.5e-32).
+ *        n*C1 is subtracted by one exact fma, n*C2 and n*C3 as exact products.
+ *        n is x_hi * fl(2/pi) rounded to an integer, so |r| <= 0.908
  *      - Large (|x| >= 2^20): Payne-Hanek using integer 2/pi table, combining
  *        x_hi and x_lo fractions in 64-bit fixed-point before converting to
- *        fp32mp2 (pure fp32 arithmetic, no fp64). Delivers ~46 bits in the
- *        reduced argument r; final precision can be lower for tan near
+ *        fp32mp2 (pure fp32 arithmetic, no fp64), |r| <= pi/4. Delivers ~46 bits
+ *        in the reduced argument r; final precision can be lower for tan near
  *        singularities, where small input quantization is amplified by tan'.
- *   2. Evaluate sin(r) and cos(r) via Taylor polynomials in fp32mp2
- *      sin: 8 terms (x through x^15), cos: 9 terms (1 through x^16)
- *   3. Map to correct quadrant using n mod 4
- *      sincos computes both kernels; sin/cos call sincos internally
+ *   2. sin(r) = r (1 + r^2 S(r^2)) and cos(r) = 1 + r^2 C(r^2), with S and C
+ *      minimax polynomials of degree 6 on |r| <= 0.91: three coefficients
+ *      as pairs, four in single precision
+ *   3. Map to correct quadrant using n mod 4. sincos and tan evaluate both
+ *      kernels; sin and cos evaluate one, its coefficients selected by the
+ *      parity of n
  * ====================================================================
  */
 
@@ -232,12 +235,12 @@ __internal_fpmp2_frac_to_angle(uint32_t __hi, uint32_t __lo, uint32_t __s, _FpTy
 
 /*
  * Trigonometric argument reduction for fp32mp2.
- * Returns quadrant (mod 4) and reduced argument r  in  [-pi/4, pi/4].
+ * Returns quadrant (mod 4) and reduced argument r, |r| <= 0.908.
  *
  * Three paths:
  *   Tiny:  |x| < pi/4 -> no reduction
- *   Fast:  |x| < 2^20 -> Cody-Waite with exact error tracking
- *   Large: |x| >= 2^20 -> Payne-Hanek (integer 2/pi table)
+ *   Fast:  |x| < 2^20 -> Cody-Waite with a 4-piece pi/2, |r| <= 0.908
+ *   Large: |x| >= 2^20 -> Payne-Hanek (integer 2/pi table), |r| <= pi/4
  */
 template <typename _FpType>
 _CCCL_FPMP_CORE_API void __internal_fpmp2_trig_reduction(
@@ -245,8 +248,8 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_trig_reduction(
 {
   using __afloat = fp32mp2_high;
 
-  _FpType __abs_hi    = (__x_hi < _FpType(0)) ? -__x_hi : __x_hi;
-  uint32_t __abs_bits = ::cuda::std::bit_cast<uint32_t>(__abs_hi);
+  // The sign bit is cleared, not negated away: -0 is below pi/4 too, and comes back as -0.
+  uint32_t __abs_bits = ::cuda::std::bit_cast<uint32_t>(__x_hi) & 0x7FFFFFFFU;
 
   /* No reduction for |x| < pi/4 */
   if (__abs_bits < 0x3F490FDBU)
@@ -271,14 +274,10 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_trig_reduction(
     /* -- Fast path: Cody-Waite for |x_hi| < 2^20 --
      *
      * pi/2 split into 4 float pieces, whose sum misses pi/2 by 8.5e-32.
-     * C1 has 2 trailing zero mantissa bits, making n*C1 exact
-     * for |n| < 2^12 via two_mult_fma, and accurate for larger n.
      *
-     * Error tracking: two_mult_fma gives exact n*C1 = ph + pl,
-     * two_sum gives exact x_hi - ph = s + e.
-     * Remaining corrections accumulated in fp32mp2_high
-     * to preserve ~46 bits when s is near zero (catastrophic
-     * cancellation near multiples of pi).
+     * n is x_hi * fl(2/pi) rounded to an integer. Over every float x_hi in
+     * [pi/4, 2^20) that leaves |x_hi - n*pi/2| <= 0.8767, and |x_lo| <= 2^-5, so
+     * |r| <= 0.908: the kernels are fitted on |r| <= 0.91.
      */
     constexpr _FpType __c1 = _FpType(1.5707962512969971e+000);
     constexpr _FpType __c2 = _FpType(7.5497894158615964e-008);
@@ -288,45 +287,44 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_trig_reduction(
     int __n       = ::cuda::__fpmp_fp2int_rn(__x_hi * _FpType(0x1.45f306p-1f));
     _FpType __n_f = ::cuda::__fpmp_int2fp_rn<_FpType>(__n);
 
-    /* Exact product n*C1 = ph + pl */
-    _FpType __pl;
-    _FpType __ph = ::cuda::__fpmp_two_mult_fma(__n_f, __c1, &__pl);
-
-    /* Exact subtraction x_hi - ph = s + e */
-    _FpType __e;
-    _FpType __s = ::cuda::__fpmp_two_sum(__x_hi, -__ph, &__e);
-
-    /* Build result as fp32mp2_high from exact (s, e),
-     * then accumulate corrections with full precision.
+    /* s = x_hi - n*C1, exact in one fma: |s| < 1 (n*|pi/2 - C1| < 0.06), C1 is a
+     * multiple of 2^-22, and so is x_hi from 2 on. Below 2, n <= 1 and x_hi is a
+     * multiple of 2^-23, of 2^-24 below 1, where |s| > 1/2. Checked for every
+     * float x_hi in [pi/4, 2^20).
      */
-    __afloat __result(__s, __e);
-    /* Subtracting pl and adding x_lo as single limbs gives the same values as adding them as
-     * pairs with a zero low word, in fewer operations, and makes sin, cos, sincos and tan 4-10%
-     * faster on sm_100 and sm_120. On sm_90, nvcc schedules the single-limb form worse: sin,
-     * cos and sincos ran 1-4% slower than with the pairs (tan 4% faster), so sm_90 keeps them.
-     */
-    NV_IF_ELSE_TARGET(NV_IS_EXACTLY_SM_90,
-                      (__result = __result + __afloat(-__pl); __result = __result + __afloat(__x_lo);),
-                      (__result = __result - __pl; __result = __result + __x_lo;))
+    const _FpType __s = ::cuda::__fpmp_fma_rn(__n_f, -__c1, __x_hi);
 
-    /* Exact product n*C2 = nC2_hi + nC2_lo via two_mult_fma */
-    _FpType __n_c2_lo;
-    _FpType __n_c2_hi = ::cuda::__fpmp_two_mult_fma(__n_f, __c2, &__n_c2_lo);
-    __result          = __result - __afloat(__n_c2_hi, __n_c2_lo);
-
-    /* nC3_hi + nC3_lo = n*(C3 + C4) to within 2^-47 * n*C3: n*C3 exactly, and n*C4 added
-     * to its low word by one fma. Near a multiple of pi/2, r is far smaller than n*C3, so
-     * neither rounding n*C3 (error up to 2^-24 * n*C3) nor cutting pi/2 at C3
-     * (error n * 9.5e-23) keeps the error small relative to r.
+    /* n*C2 = h2 + l2 exactly. h3 + l3 = n*(C3 + C4) to within 2^-49 * n*C3: n*C3
+     * exactly, and n*C4 added to its low word by one fma.
      */
-    _FpType __n_c3_lo;
-    _FpType __n_c3_hi = ::cuda::__fpmp_two_mult_fma(__n_f, __c3, &__n_c3_lo);
-    __n_c3_lo         = ::cuda::__fpmp_fma_rn(__n_f, __c4, __n_c3_lo);
-    __result          = __result - __afloat(__n_c3_hi, __n_c3_lo);
+    _FpType __l2;
+    const _FpType __h2 = ::cuda::__fpmp_two_mult_fma(__n_f, __c2, &__l2);
+    _FpType __l3;
+    const _FpType __h3 = ::cuda::__fpmp_two_mult_fma(__n_f, __c3, &__l3);
+    __l3               = ::cuda::__fpmp_fma_rn(__n_f, __c4, __l3);
+
+    /* x_lo - h2 exactly, formed off the path of s. Adding s is DWPlusFP: within
+     * 2u^2 of the sum whatever cancels.
+     */
+    _FpType __a_lo;
+    const _FpType __a_hi = ::cuda::__fpmp_two_sum(__x_lo, -__h2, &__a_lo);
+    __afloat __result(__a_hi, __a_lo);
+    __result = __result + __s;
+
+    /* -(l2 + h3 + l3) = u + v + w exactly. Near a multiple of pi/2 the sum so far
+     * cancels against u, and v and l3 are what is left of r: rounded into one float
+     * they would cost another 2^-49 * n*C3 there, as much as l3 itself is off by.
+     * w is below ulp(v) / 2 and goes into the low word.
+     */
+    _FpType __v;
+    _FpType __w;
+    const _FpType __u = ::cuda::__fpmp_two_sum(-__l2, -__h3, &__v);
+    __v               = ::cuda::__fpmp_two_sum(__v, -__l3, &__w);
+    __result          = __result + __afloat(__u, __v);
 
     *__quadrant = __n;
     *__r_hi     = __result.hi();
-    *__r_lo     = __result.lo();
+    *__r_lo     = ::cuda::__fpmp_add_rn(__result.lo(), __w);
   }
   else
   {
@@ -423,79 +421,147 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_trig_reduction(
 }
 
 /*
- * Sin kernel: evaluate sin(x) for |x| <= pi/4 using fp32mp2 Taylor series.
- * sin(x) = x + x^3*Q(x^2), Q(u) = Sum Taylor coefficients from -1/3! to -1/15!.
- * Upper terms (s7..s4) in single precision, lower terms (s3..s1) in fp32mp2.
+ * Kernel polynomial: the unnormalized pair z = u (k1 + k2 u + ... + k7 u^6) for u = x^2, where
+ *   sin(x) = x (1 + z)  with the sine coefficients,
+ *   cos(x) = 1 + z      with the cosine coefficients (k1 = -1/2),
+ * both minimax on |x| <= 0.91 (Sollya fpminimax, k1..k3 as 48-bit pairs and k4..k7 as single
+ * floats; relative error below 2^-57.4 and 2^-55.4). `__cosine` selects the set, at compile
+ * time when it is a constant.
+ *
+ * k4..k7 run in single precision. The rounding error of the last of those steps is up to
+ * 2^-25 * k4 * u^4, or 2^-42 of cos(x); it is recovered (k4 - w is exact, as |t u| < k4 / 100)
+ * and carried into the pair steps. Each pair step adds its product to a coefficient at least
+ * 14 times larger, so the sum is a Fast2Sum. x_lo^2 and the products of two low words are
+ * dropped.
+ */
+template <typename _FpType>
+_CCCL_FPMP_CORE_API void __internal_fpmp2_trig_poly(
+  const bool __cosine, _FpType __x_hi, _FpType __x_lo, _FpType* __z_hi, _FpType* __z_lo) noexcept
+{
+  // k1 hi, k1 lo, k2 hi, k2 lo, k3 hi, k3 lo, k4, k5, k6, k7
+  constexpr float __sin_k[10] = {
+    -0x1.555556p-3f,
+    0x1.555554p-28f,
+    0x1.111112p-7f,
+    -0x1.dddbe4p-32f,
+    -0x1.a01a02p-13f,
+    0x1.780028p-39f,
+    0x1.71de3cp-19f,
+    -0x1.ae65dp-26f,
+    0x1.61c79ap-33f,
+    -0x1.e3e4bap-41f,
+  };
+  constexpr float __cos_k[10] = {
+    -0x1p-1f,
+    0.0f,
+    0x1.555556p-5f,
+    -0x1.5554dp-30f,
+    -0x1.6c16c2p-10f,
+    0x1.27164cp-35f,
+    0x1.a01a02p-16f,
+    -0x1.27e528p-22f,
+    0x1.1effcap-29f,
+    -0x1.9745dcp-37f,
+  };
+  float __k[10];
+  _CCCL_PRAGMA_UNROLL_FULL()
+  for (int __i = 0; __i < 10; ++__i)
+  {
+    __k[__i] = __cosine ? __cos_k[__i] : __sin_k[__i];
+  }
+
+  float __p_lo;
+  float __e;
+
+  // u = x^2
+  const float __u_hi = ::cuda::__fpmp_two_mult_fma(__x_hi, __x_hi, &__p_lo);
+  const float __u_lo = ::cuda::__fpmp_fma_rn(::cuda::__fpmp_add_rn(__x_hi, __x_hi), __x_lo, __p_lo);
+
+  // w + d = k4 + u (k5 + u (k6 + u k7)), d the rounding error of the last step
+  float __t       = ::cuda::__fpmp_fma_rn(__k[9], __u_hi, __k[8]);
+  __t             = ::cuda::__fpmp_fma_rn(__t, __u_hi, __k[7]);
+  const float __w = ::cuda::__fpmp_fma_rn(__t, __u_hi, __k[6]);
+  const float __d = ::cuda::__fpmp_fma_rn(__t, __u_hi, ::cuda::__fpmp_sub_rn(__k[6], __w));
+
+  // q3 = k3 + u (w + d)
+  float __p_hi        = ::cuda::__fpmp_two_mult_fma(__w, __u_hi, &__p_lo);
+  __p_lo              = ::cuda::__fpmp_fma_rn(__w, __u_lo, __p_lo);
+  __p_lo              = ::cuda::__fpmp_fma_rn(__d, __u_hi, __p_lo);
+  const float __q3_hi = ::cuda::__fpmp_fast_two_sum(__k[4], __p_hi, &__e);
+  const float __q3_lo = ::cuda::__fpmp_add_rn(::cuda::__fpmp_add_rn(__k[5], __p_lo), __e);
+
+  // q2 = k2 + u q3
+  __p_hi              = ::cuda::__fpmp_two_mult_fma(__q3_hi, __u_hi, &__p_lo);
+  __p_lo              = ::cuda::__fpmp_fma_rn(__q3_hi, __u_lo, __p_lo);
+  __p_lo              = ::cuda::__fpmp_fma_rn(__q3_lo, __u_hi, __p_lo);
+  const float __q2_hi = ::cuda::__fpmp_fast_two_sum(__k[2], __p_hi, &__e);
+  const float __q2_lo = ::cuda::__fpmp_add_rn(::cuda::__fpmp_add_rn(__k[3], __p_lo), __e);
+
+  // q1 = k1 + u q2
+  __p_hi              = ::cuda::__fpmp_two_mult_fma(__q2_hi, __u_hi, &__p_lo);
+  __p_lo              = ::cuda::__fpmp_fma_rn(__q2_hi, __u_lo, __p_lo);
+  __p_lo              = ::cuda::__fpmp_fma_rn(__q2_lo, __u_hi, __p_lo);
+  const float __q1_hi = ::cuda::__fpmp_fast_two_sum(__k[0], __p_hi, &__e);
+  const float __q1_lo = ::cuda::__fpmp_add_rn(::cuda::__fpmp_add_rn(__k[1], __p_lo), __e);
+
+  // z = u q1
+  *__z_hi = ::cuda::__fpmp_two_mult_fma(__q1_hi, __u_hi, &__p_lo);
+  __p_lo  = ::cuda::__fpmp_fma_rn(__q1_hi, __u_lo, __p_lo);
+  *__z_lo = ::cuda::__fpmp_fma_rn(__q1_lo, __u_hi, __p_lo);
+}
+
+/*
+ * cos(x) when `__cosine`, else sin(x), for |x| <= 0.91: a (1 + z) with a = 1 or a = x and
+ * the matching coefficients. One polynomial serves sin(x) and cos(x) of a reduced argument
+ * whose quadrant picks the function. |z| < 1/2, so a + a z is a Fast2Sum.
+ */
+template <typename _FpType>
+_CCCL_FPMP_CORE_API void __internal_fpmp2_sin_or_cos_kernel(
+  const bool __cosine, _FpType __x_hi, _FpType __x_lo, _FpType* __res_hi, _FpType* __res_lo) noexcept
+{
+  float __z_hi;
+  float __z_lo;
+  ::cuda::__internal_fpmp2_trig_poly(__cosine, __x_hi, __x_lo, &__z_hi, &__z_lo);
+
+  const float __a_hi = __cosine ? 1.0f : __x_hi;
+  const float __a_lo = __cosine ? 0.0f : __x_lo;
+
+  float __y_lo;
+  float __e;
+  const float __y_hi = ::cuda::__fpmp_two_mult_fma(__a_hi, __z_hi, &__y_lo);
+  __y_lo             = ::cuda::__fpmp_fma_rn(__a_hi, __z_lo, __y_lo);
+  __y_lo             = ::cuda::__fpmp_fma_rn(__a_lo, __z_hi, __y_lo);
+  const float __r_hi = ::cuda::__fpmp_fast_two_sum(__a_hi, __y_hi, &__e);
+  const float __r_lo = ::cuda::__fpmp_add_rn(::cuda::__fpmp_add_rn(__a_lo, __y_lo), __e);
+  *__res_hi          = ::cuda::__fpmp_fast_two_sum(__r_hi, __r_lo, __res_lo);
+}
+
+/*
+ * Sin kernel: sin(x) = x (1 + z) for |x| <= 0.91.
  */
 template <typename _FpType>
 _CCCL_FPMP_CORE_API void
 __internal_fpmp2_sin_kernel(_FpType __x_hi, _FpType __x_lo, _FpType* __res_hi, _FpType* __res_lo) noexcept
 {
-  using __ffloat = fp32mp2_low;
-
-  constexpr __ffloat __s1(-1.6666666666666666e-01);
-  constexpr __ffloat __s2(8.3333333333333333e-03);
-  constexpr __ffloat __s3(-1.9841269841269841e-04);
-  constexpr float __s4(2.7557319223985893e-06f);
-  constexpr float __s5(-2.5052108385441719e-08f);
-  constexpr float __s6(1.6059043836821615e-10f);
-  constexpr float __s7(-7.6471637318198165e-13f);
-
-  __ffloat __x(__x_hi, __x_lo);
-  __ffloat __x2 = __x * __x;
-  float __x2f   = __x2.hi();
-
-  float __qf = __s7;
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __s6);
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __s5);
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __s4);
-
-  __ffloat __q = __qf * __x2 + __s3;
-  __q          = __q * __x2 + __s2;
-  __q          = __q * __x2 + __s1;
-
-  __ffloat __result = renormalize(__q * __x2 * __x + __x);
-  *__res_hi         = __result.hi();
-  *__res_lo         = __result.lo();
+  ::cuda::__internal_fpmp2_sin_or_cos_kernel(false, __x_hi, __x_lo, __res_hi, __res_lo);
 }
 
 /*
- * Cos kernel: evaluate cos(x) for |x| <= pi/4 using fp32mp2 Taylor series.
- * cos(x) = 1 + x^2*Q(x^2), Q(u) = Sum Taylor coefficients from -1/2! to 1/16!.
- * Upper terms (c8..c4) in single precision, lower terms (c3..c1) in fp32mp2.
+ * Cos kernel: cos(x) = 1 + z for |x| <= 0.91. The same value as
+ * __internal_fpmp2_sin_or_cos_kernel gives with a = 1, without its products by 1 and 0.
  */
 template <typename _FpType>
 _CCCL_FPMP_CORE_API void
 __internal_fpmp2_cos_kernel(_FpType __x_hi, _FpType __x_lo, _FpType* __res_hi, _FpType* __res_lo) noexcept
 {
-  using __ffloat = fp32mp2_low;
+  float __z_hi;
+  float __z_lo;
+  ::cuda::__internal_fpmp2_trig_poly(true, __x_hi, __x_lo, &__z_hi, &__z_lo);
 
-  constexpr float __c1(-0.5f);
-  constexpr __ffloat __c2(4.1666666666666667e-02);
-  constexpr __ffloat __c3(-1.3888888888888889e-03);
-  constexpr float __c4(2.4801587301587302e-05f);
-  constexpr float __c5(-2.7557319223985893e-07f);
-  constexpr float __c6(2.0876756987868099e-09f);
-  constexpr float __c7(-1.1470745597729725e-11f);
-  constexpr float __c8(4.7794773323873853e-14f);
-
-  __ffloat __x(__x_hi, __x_lo);
-  __ffloat __x2 = __x * __x;
-  float __x2f   = __x2.hi();
-
-  float __qf = __c8;
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __c7);
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __c6);
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __c5);
-  __qf       = ::cuda::__fpmp_fma_rn(__qf, __x2f, __c4);
-
-  __ffloat __q = __qf * __x2 + __c3;
-  __q          = __q * __x2 + __c2;
-  __q          = __q * __x2 + __c1;
-
-  __ffloat __result = renormalize(__q * __x2 + 1.0f);
-  *__res_hi         = __result.hi();
-  *__res_lo         = __result.lo();
+  float __e;
+  const float __r_hi = ::cuda::__fpmp_fast_two_sum(1.0f, __z_hi, &__e);
+  const float __r_lo = ::cuda::__fpmp_add_rn(__z_lo, __e);
+  *__res_hi          = ::cuda::__fpmp_fast_two_sum(__r_hi, __r_lo, __res_lo);
 }
 
 /*
@@ -654,7 +720,7 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_acos_poly(const fpmp2<_FpType>& __y, f
  * Sine and cosine sincos(x, &s, &c) (fp32mp2) - dedicated implementation
  * --------------------------------------------------------------------
  * sincos for fp32mp2: compute sin(x) and cos(x) simultaneously.
- * Shared argument reduction, separate sin/cos kernels on [-pi/4, pi/4],
+ * Shared argument reduction, separate sin/cos kernels on |r| <= 0.91,
  * quadrant-based swap and sign adjustment.
  */
 _CCCL_FPMP_CORE_API void __internal_fpmp2_sincos(
@@ -668,11 +734,7 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_sincos(
   ::cuda::__internal_fpmp2_sin_kernel(__r_hi, __r_lo, &__s_hi, &__s_lo);
   ::cuda::__internal_fpmp2_cos_kernel(__r_hi, __r_lo, &__c_hi, &__c_lo);
 
-  int __q = __quadrant & 3;
-  if (__q < 0)
-  {
-    __q += 4;
-  }
+  const int __q = __quadrant & 3;
 
   if (__q & 1)
   {
@@ -695,7 +757,8 @@ _CCCL_FPMP_CORE_API void __internal_fpmp2_sincos(
     __s_lo = -__s_lo;
   }
 
-  *__sin_hi = __s_hi;
+  // sin(-0) is -0; the kernel's x + x z is +0 there.
+  *__sin_hi = (__x_hi == 0.0f) ? __x_hi : __s_hi;
   *__sin_lo = __s_lo;
   *__cos_hi = __c_hi;
   *__cos_lo = __c_lo;
@@ -730,13 +793,27 @@ _CCCL_FPMP_MATH_DISPATCH_1A_2OUT(sincos)
  * --------------------------------------------------------------------
  * Sine sin(x) (fp32mp2) - dedicated implementation
  * --------------------------------------------------------------------
- * sin for fp32mp2: calls sincos and returns only the sine.
+ * sin for fp32mp2: the reduction of sincos, then one kernel. sin(x) is +-sin(r) in an even
+ * quadrant and +-cos(r) in an odd one, so the quadrant's parity selects the coefficients of a
+ * single polynomial. The result is the sine sincos returns.
  */
 _CCCL_FPMP_CORE_API void
 __internal_fpmp2_sin(const float __x_hi, const float __x_lo, float* __res_hi, float* __res_lo) noexcept
 {
-  float __c_hi, __c_lo;
-  ::cuda::__fpmp2_sincos(__x_hi, __x_lo, __res_hi, __res_lo, &__c_hi, &__c_lo);
+  int __quadrant;
+  float __r_hi, __r_lo;
+  ::cuda::__internal_fpmp2_trig_reduction(__x_hi, __x_lo, &__quadrant, &__r_hi, &__r_lo);
+
+  float __s_hi, __s_lo;
+  ::cuda::__internal_fpmp2_sin_or_cos_kernel((__quadrant & 1) != 0, __r_hi, __r_lo, &__s_hi, &__s_lo);
+
+  const bool __negate = (__quadrant & 2) != 0;
+  __s_hi              = __negate ? -__s_hi : __s_hi;
+  __s_lo              = __negate ? -__s_lo : __s_lo;
+
+  // sin(-0) is -0; the kernel's x + x z is +0 there.
+  *__res_hi = (__x_hi == 0.0f) ? __x_hi : __s_hi;
+  *__res_lo = __s_lo;
 }
 
 /*
@@ -762,13 +839,24 @@ _CCCL_FPMP_MATH_DISPATCH_1A(sin)
  * --------------------------------------------------------------------
  * Cosine cos(x) (fp32mp2) - dedicated implementation
  * --------------------------------------------------------------------
- * cos for fp32mp2: calls sincos and returns only the cosine.
+ * cos for fp32mp2: the reduction of sincos, then one kernel. cos(x) is +-cos(r) in an even
+ * quadrant and +-sin(r) in an odd one, so the quadrant's parity selects the coefficients of a
+ * single polynomial. The result is the cosine sincos returns.
  */
 _CCCL_FPMP_CORE_API void
 __internal_fpmp2_cos(const float __x_hi, const float __x_lo, float* __res_hi, float* __res_lo) noexcept
 {
-  float __s_hi, __s_lo;
-  ::cuda::__fpmp2_sincos(__x_hi, __x_lo, &__s_hi, &__s_lo, __res_hi, __res_lo);
+  int __quadrant;
+  float __r_hi, __r_lo;
+  ::cuda::__internal_fpmp2_trig_reduction(__x_hi, __x_lo, &__quadrant, &__r_hi, &__r_lo);
+
+  float __c_hi, __c_lo;
+  ::cuda::__internal_fpmp2_sin_or_cos_kernel((__quadrant & 1) == 0, __r_hi, __r_lo, &__c_hi, &__c_lo);
+
+  /* Negate in quadrants 1 and 2 (mod 4). */
+  const bool __negate = ((__quadrant + 1) & 2) != 0;
+  *__res_hi           = __negate ? -__c_hi : __c_hi;
+  *__res_lo           = __negate ? -__c_lo : __c_lo;
 }
 
 /*
@@ -795,7 +883,7 @@ _CCCL_FPMP_MATH_DISPATCH_1A(cos)
  * Tangent tan(x) (fp32mp2) - dedicated implementation
  * --------------------------------------------------------------------
  * Algorithm (no FP64 dependency on the hot path):
- *   1. Reduce x to r in [-pi/4, pi/4] via the shared
+ *   1. Reduce x to r, |r| <= 0.908, via the shared
  *      __internal_fpmp2_trig_reduction; this also returns the quadrant
  *      index q (modulo 4).
  *   2. Evaluate sin(r) and cos(r) on the reduced interval via the
@@ -807,9 +895,8 @@ _CCCL_FPMP_MATH_DISPATCH_1A(cos)
  *      here because tan(x + pi) = tan(x) absorbs the q == 2,3 sign
  *      flips that sincos performs on its sin/cos outputs.
  *
- * One shared reduction + one + sin kernel + one cos kernel + one fp32mp2 division.  Reusing the
- * already-tuned sin/cos kernels inherits their ~46-bit accuracy
- * envelope without having to fit a separate tan polynomial.
+ * One shared reduction + one sin kernel + one cos kernel + one fp32mp2 division.  Reusing the
+ * sin/cos kernels inherits their accuracy without having to fit a separate tan polynomial.
  *
  * Singularities at x === pi/2 (mod pi) produce +-inf through the q-odd
  * branch when sin(r) underflows to zero (matches the IEEE
@@ -833,7 +920,8 @@ __internal_fpmp2_tan(const float __x_hi, const float __x_lo, float* __res_hi, fl
 
   __mp2_t __result = (__quadrant & 1) ? __mp2_t(-__c / __s) : __mp2_t(__s / __c);
 
-  *__res_hi = __result.hi();
+  // tan(-0) is -0; the quotient of the kernels is +0 there.
+  *__res_hi = (__x_hi == 0.0f) ? __x_hi : __result.hi();
   *__res_lo = __result.lo();
 }
 
@@ -1238,7 +1326,7 @@ _CCCL_FPMP_MATH_DISPATCH_1A(acos)
  * ====================================================================
  * fp32mp2 reduces x = n + f, |f| <= 1/2, by splitting the limb pair.
  * f is folded into [-1/4, 1/4], scaled by pi, and evaluated with the
- * sincos Taylor kernels. No radian argument reduction is involved.
+ * sincos kernels. No radian argument reduction is involved.
  * fp64mp2 remains a double-precision fallback.
  */
 
@@ -1361,7 +1449,7 @@ _CCCL_FPMP_MATH_DISPATCH_1A(cospi)
  * Sine and cosine of pi*x sincospi(x, &s, &c) (fp32mp2)
  * --------------------------------------------------------------------
  * x = n + f, |f| <= 1/2. Fold f into [-1/4, 1/4] so pi*f is inside the
- * Taylor kernels, then apply the cofunction identity and the sign (-1)^n.
+ * kernels' range, then apply the cofunction identity and the sign (-1)^n.
  */
 _CCCL_FPMP_CORE_API void __internal_fpmp2_sincospi(
   const float __x_hi, const float __x_lo, float* __sin_hi, float* __sin_lo, float* __cos_hi, float* __cos_lo) noexcept
