@@ -72,7 +72,10 @@ _CCCL_FPMP_CORE_API void __fpmp2_fmax(
     *__res_lo = __x_lo;
     return;
   }
-  const bool __x_greater = (__x_hi > __y_hi) || (__x_hi == __y_hi && __x_lo > __y_lo);
+  // Of two zeros, +0 is the larger one (IEEE 754-2019 maximumNumber).
+  const bool __x_greater =
+    (__x_hi > __y_hi)
+    || (__x_hi == __y_hi && (__x_lo > __y_lo || (__x_hi == _FpType(0) && ::cuda::std::signbit(__y_hi))));
   if (__x_greater)
   {
     *__res_hi = __x_hi;
@@ -120,7 +123,10 @@ _CCCL_FPMP_CORE_API void __fpmp2_fmin(
     *__res_lo = __x_lo;
     return;
   }
-  const bool __x_less = (__x_hi < __y_hi) || (__x_hi == __y_hi && __x_lo < __y_lo);
+  // Of two zeros, -0 is the smaller one (IEEE 754-2019 minimumNumber).
+  const bool __x_less =
+    (__x_hi < __y_hi)
+    || (__x_hi == __y_hi && (__x_lo < __y_lo || (__x_hi == _FpType(0) && ::cuda::std::signbit(__x_hi))));
   if (__x_less)
   {
     *__res_hi = __x_hi;
@@ -213,26 +219,39 @@ _CCCL_FPMP_CORE_API void __fpmp2_min(
 
 /*
  * --------------------------------------------------------------------
- * Positive difference fdim(x, y) (fp32mp2) - double fallback
+ * Positive difference fdim(x, y) (fp32mp2 and fp64mp2)
  * --------------------------------------------------------------------
+ * x - y where x > y and +0 otherwise, the comparison being the lexicographic one of fmax.
+ * The difference is the accurate one (fpmp2_accuracy::high) whatever the accuracy of the
+ * type, since x and y may cancel. A NaN operand gives NaN; a difference that overflows,
+ * or that of unlike infinities, gives +inf with a zero low limb.
  */
-_CCCL_FPMP_MATH_FALLBACK_2A(fdim)
-
-/*
- * --------------------------------------------------------------------
- * Positive difference fdim(x, y) (fp64mp2) - double fallback
- * --------------------------------------------------------------------
- */
+template <typename _FpType>
 _CCCL_FPMP_CORE_API void __internal_fpmp2_fdim(
-  const double __x_hi,
-  const double __x_lo,
-  const double __y_hi,
-  const double __y_lo,
-  double* __res_hi,
-  double* __res_lo) noexcept
+  const _FpType __x_hi,
+  const _FpType __x_lo,
+  const _FpType __y_hi,
+  const _FpType __y_lo,
+  _FpType* __res_hi,
+  _FpType* __res_lo) noexcept
 {
-  ::cuda::__fpmp2_from_double(
-    ::fdim(::cuda::__fpmp2_to_double(__x_hi, __x_lo), ::cuda::__fpmp2_to_double(__y_hi, __y_lo)), __res_hi, __res_lo);
+  if (::cuda::__fpmp_internal_isnan(__x_hi) || ::cuda::__fpmp_internal_isnan(__y_hi))
+  {
+    *__res_hi = *__res_lo = ::cuda::std::numeric_limits<_FpType>::quiet_NaN();
+  }
+  else if ((__x_hi > __y_hi) || (__x_hi == __y_hi && __x_lo > __y_lo))
+  {
+    ::cuda::__fpmp2_high_sub(__x_hi, __x_lo, __y_hi, __y_lo, __res_hi, __res_lo);
+    if (!(*__res_hi <= (::cuda::std::numeric_limits<_FpType>::max)()))
+    {
+      *__res_hi = ::cuda::std::numeric_limits<_FpType>::infinity();
+      *__res_lo = _FpType(0);
+    }
+  }
+  else
+  {
+    *__res_hi = *__res_lo = _FpType(0);
+  }
 }
 
 _CCCL_FPMP_MATH_DISPATCH_2A(fdim)
@@ -316,7 +335,7 @@ _CCCL_FPMP_MATH_DISPATCH_1A_RETINT(isnan)
  */
 _CCCL_FPMP_CORE_API int __internal_fpmp2_signbit(const float __x_hi, [[maybe_unused]] const float __x_lo) noexcept
 {
-  return ::cuda::std::signbit(static_cast<double>(__x_hi));
+  return ::cuda::std::signbit(__x_hi);
 }
 
 /*

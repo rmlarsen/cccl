@@ -1424,7 +1424,7 @@ template <typename _FpType, fpmp2_accuracy _TypeAcc>
 [[nodiscard]] _CCCL_HOST_DEVICE_API inline fpmp2<_FpType, _TypeAcc> sqrt(const fpmp2<_FpType, _TypeAcc>& __x) noexcept
 {
   _FpType __rhi, __rlo;
-  ::cuda::__fpmp2_sqrt(__x.hi(), __x.lo(), &__rhi, &__rlo);
+  ::cuda::__fpmp2_sqrt_checked(__x.hi(), __x.lo(), &__rhi, &__rlo);
   return fpmp2<_FpType, _TypeAcc>(__rhi, __rlo);
 }
 
@@ -1432,7 +1432,7 @@ template <typename _FpType, fpmp2_accuracy _TypeAcc>
 [[nodiscard]] _CCCL_HOST_DEVICE_API inline fpmp2<_FpType, _TypeAcc> rsqrt(const fpmp2<_FpType, _TypeAcc>& __x) noexcept
 {
   _FpType __rhi, __rlo;
-  ::cuda::__fpmp2_rsqrt(__x.hi(), __x.lo(), &__rhi, &__rlo);
+  ::cuda::__fpmp2_rsqrt_checked(__x.hi(), __x.lo(), &__rhi, &__rlo);
   return fpmp2<_FpType, _TypeAcc>(__rhi, __rlo);
 }
 

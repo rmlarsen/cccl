@@ -233,10 +233,9 @@ _CCCL_FPMP_CORE_API void __fpmp2_copysign(
   _FpType* __res_hi,
   _FpType* __res_lo) noexcept
 {
-  const bool __flip =
-    (::cuda::std::signbit(static_cast<double>(__x_hi)) != ::cuda::std::signbit(static_cast<double>(__y_hi)));
-  *__res_hi = __flip ? -__x_hi : __x_hi;
-  *__res_lo = __flip ? -__x_lo : __x_lo;
+  const bool __flip = (::cuda::std::signbit(__x_hi) != ::cuda::std::signbit(__y_hi));
+  *__res_hi         = __flip ? -__x_hi : __x_hi;
+  *__res_lo         = __flip ? -__x_lo : __x_lo;
 }
 
 /* nextafter has no dedicated fp32mp2 kernel: the fallback macro composes it over

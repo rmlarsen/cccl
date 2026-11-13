@@ -443,8 +443,8 @@ __internal_fpmp2_asinh(const float __x_hi, const float __x_lo, float* __res_hi, 
       *__res_lo = __neg ? -__r_lo : __r_lo;
       return;
     }
-    // |x| + r, with r > |x|
-    const float __t = ::cuda::__fpmp_fast_two_sum(__s_hi, __a_hi, &__e);
+    // |x| + r. r > |x|, but next to a power of two its high limb may round to the float below that of |x|.
+    const float __t = ::cuda::__fpmp_two_sum(__s_hi, __a_hi, &__e);
     __v_hi =
       ::cuda::__fpmp_fast_two_sum(__t, ::cuda::__fpmp_add_rn(__e, ::cuda::__fpmp_add_rn(__s_lo, __a_lo)), &__v_lo);
   }
@@ -532,8 +532,8 @@ __internal_fpmp2_acosh(const float __x_hi, const float __x_lo, float* __res_hi, 
       ::cuda::__internal_fpmp2_log1p(__t_hi, __t_lo, __res_hi, __res_lo);
       return;
     }
-    // x + sqrt(d (d + 2)): the root is below x
-    const float __t = ::cuda::__fpmp_fast_two_sum(__x_hi, __s_hi, &__e);
+    // x + sqrt(d (d + 2)). The root is below x, but its high limb may round to the float above that of x.
+    const float __t = ::cuda::__fpmp_two_sum(__x_hi, __s_hi, &__e);
     __v_hi =
       ::cuda::__fpmp_fast_two_sum(__t, ::cuda::__fpmp_add_rn(__e, ::cuda::__fpmp_add_rn(__s_lo, __x_lo)), &__v_lo);
   }
