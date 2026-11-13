@@ -363,66 +363,57 @@ _CCCL_FPMP_MATH_DISPATCH_1A(erf)
  * --------------------------------------------------------------------
  * Complementary error function erfc(x) (fp32mp2) - dedicated implementation
  * --------------------------------------------------------------------
- * Computes erfc(x) = erfcx(|x|) * exp(-x^2), where erfcx is the
- * scaled complementary error function erfcx(a) = (1+2a)*exp(a^2)*erfc(a).
+ * Computes erfc(x) = erfcx(|x|) * exp(-x^2), where erfcx(a) = exp(a^2) * erfc(a)
+ * is the scaled complementary error function.
  *
- * Algorithm:
- *   1. Transform variable: t = (|x| - 4) / (|x| + 4)  (maps [0,inf) -> [-1,1))
- *   2. Evaluate degree-22 Chebyshev polynomial in t to approximate
- *      (1+2|x|)*exp(x^2)*erfc(|x|), then divide by (1+2|x|) to get erfcx.
- *   3. Evaluate exp(-x^2) via argument reduction x^2 = n*ln2 + r and a
- *      degree-11 polynomial for exp(r), with split exponent scaling
- *      for large |x^2|; x^2 enters the reduction exactly.
- *   4. Multiply erfcx * exp(-x^2) to obtain erfc(|x|).
- *   5. For negative x, apply erfc(-x) = 2 - erfc(x).
+ * Algorithm, with a = |x|:
+ *   1. rho = 1 / (a + 4) as a pair, from one reciprocal and its residual;
+ *      s = 4 * rho and w = a * rho = 1 - s.
+ *   2. erfcx(a) = s * R(v), v = s - 9/16 = 7/16 - w, with R a degree-18
+ *      polynomial evaluated by compensated Horner. R(v) = erfcx(a) / s
+ *      varies from 1 at a = 0 to 0.2 at the largest a, and v stays in
+ *      [-0.28, 0.44], so the terms of R decay and its three highest
+ *      coefficients are single floats.
+ *   3. exp(-x^2) via the reduction -x^2 = z + i * ln 2 and a degree-11
+ *      polynomial for exp(z); x^2 enters the reduction exactly.
+ *   4. erfc(a) = erfcx(a) * exp(z) * 2^i, scaled last so that only the
+ *      scaling can underflow.
+ *   5. For negative x, erfc(-a) = 2 - erfc(a).
  *
- * Coefficient layout: lower-order Chebyshev/exp terms use single float
- * (negligible contribution), higher-order terms use fp32mp2 (__ffloat).
- * Saturates to 0 or 2 for |x| > 27.5.
+ * erfc(a) < 2^-150 for a > 10.0542, so the result is 0 (or 2) for
+ * a > 10.0546875 and R is fitted on 0 <= a <= 10.0546875 only.
  * All arithmetic is in fp32mp2 (no double-precision operations).
  * --------------------------------------------------------------------
  */
 _CCCL_FPMP_CORE_API void
 __internal_fpmp2_erfc(const float __x_hi, const float __x_lo, float* __res_hi, float* __res_lo) noexcept
 {
-  /*
-   * erfc(x) = erfcx(|x|) * exp(-x^2); erfcx = (1+2*x)*exp(x^2)*erfc(x)
-   * from Chebyshev approx.
-   */
   using __ffloat = fp32mp2_low;
 
-  /* erfcx polynomial (Chebyshev coefficients), ascending degree:
-   *   cheb[0]  = constant term (= original c22)
-   *   cheb[22] = leading coeff (= original c0)
-   * The M = 7 highest-degree entries (cheb[16..22]) are encoded as
-   * float literals -- their .lo() parts are zero by construction --
-   * so `poly_eval<poly_method::horner_mixed, 7>` evaluates them
-   * in plain float and transitions to ff arithmetic at cheb[15]. */
-  constexpr __ffloat __cheb[23] = {
-    __ffloat(1.2329951186255526E+000), // [ 0] (= c22, constant)
-    __ffloat(-1.3962111684056291E-001), // [ 1] (= c21)
-    __ffloat(1.5379652102605428E-002), // [ 2] (= c20)
-    __ffloat(6.8097054254735140E-002), // [ 3] (= c19)
-    __ffloat(-1.0103906603555676E-001), // [ 4] (= c18)
-    __ffloat(9.3732834997115544E-002), // [ 5] (= c17)
-    __ffloat(-6.6330365827532434E-002), // [ 6] (= c16)
-    __ffloat(3.7167515553018733E-002), // [ 7] (= c15)
-    __ffloat(-1.6197733895953217E-002), // [ 8] (= c14)
-    __ffloat(5.0319698792599572E-003), // [ 9] (= c13)
-    __ffloat(-7.5777429182785833E-004), // [10] (= c12)
-    __ffloat(-1.9925637684786154E-004), // [11] (= c11)
-    __ffloat(1.5062557169571788E-004), // [12] (= c10)
-    __ffloat(-2.4399558857200190E-005), // [13] (= c9)
-    __ffloat(-1.1231787437600085E-005), // [14] (= c8)
-    __ffloat(5.7087871844325649E-006), // [15] (= c7, last ff term)
-    /* high-order M = 7 entries: .lo() == 0 by construction */
-    __ffloat(3.095641e-7f), // [16] (= c6)
-    __ffloat(-8.214741e-7f), // [17] (= c5)
-    __ffloat(5.88067e-8f), // [18] (= c4)
-    __ffloat(1.0404431e-7f), // [19] (= c3)
-    __ffloat(-8.935022e-9f), // [20] (= c2)
-    __ffloat(-9.723912e-9f), // [21] (= c1)
-    __ffloat(-3.5602695e-10f) // [22] (= c0, leading)
+  /* R(v) = erfcx(a) * (a + 4) / 4 with a = 4 * (1 - s) / s and s = v + 9/16, ascending
+   * degree. Sollya fpminimax with these coefficient formats (48-bit pairs, then single
+   * floats): relative error 2^-49.1 on 0 <= a <= 10.0546875. */
+  constexpr __ffloat __r_c[19] = {
+    __ffloat(0x1.3b35b725c71cp-2), // [ 0]
+    __ffloat(0x1.32b1220caf34p-1), // [ 1]
+    __ffloat(0x1.02bfff5f4034p0), // [ 2]
+    __ffloat(0x1.792f364cf1e8p0), // [ 3]
+    __ffloat(0x1.d671b460a65p0), // [ 4]
+    __ffloat(0x1.eccbcbc7004ap0), // [ 5]
+    __ffloat(0x1.a267a16ed516p0), // [ 6]
+    __ffloat(0x1.0a65e63c8bfap0), // [ 7]
+    __ffloat(0x1.8c980cd02838p-2), // [ 8]
+    __ffloat(-0x1.cb1560041134p-5), // [ 9]
+    __ffloat(-0x1.69f5c5bf3e7cp-3), // [10]
+    __ffloat(-0x1.484d5cd596bp-4), // [11]
+    __ffloat(0x1.0ce8080f90bep-5), // [12]
+    __ffloat(0x1.921fb43e843p-5), // [13]
+    __ffloat(0x1.476f3a720628p-9), // [14]
+    __ffloat(-0x1.855c4aa0c394p-6), // [15] (last pair)
+    /* the M = 3 highest-degree entries are single floats */
+    __ffloat(-0x1.3f62fcp-8f), // [16]
+    __ffloat(0x1.a7092ep-7f), // [17]
+    __ffloat(-0x1.c535ep-9f) // [18]
   };
 
   /* exp polynomial coefficients, ascending degree:
@@ -455,34 +446,43 @@ __internal_fpmp2_erfc(const float __x_hi, const float __x_lo, float* __res_hi, f
   uint32_t __xhi = ::cuda::std::bit_cast<uint32_t>(__x.hi()) & 0x7fffffffU;
   __ffloat __a   = (__is_neg) ? -__x : __x;
 
-  // handle x > 27.5 && <= Inf
-  if ((__xhi > 0x41dc0000U) && (__xhi <= 0x7f800000U))
+  // |x| > 10.0546875, including Inf: erfc(|x|) rounds to zero
+  if ((__xhi > 0x4120e000U) && (__xhi <= 0x7f800000U))
   {
     *__res_hi = (__is_neg) ? 2.f : 0.f;
     *__res_lo = 0.f;
     return;
   }
 
-  /* erfcx kernel: (1+2*a)*exp(a^2)*erfc(a) on a = |x|, transform (a-4)/(a+4) */
-  __ffloat __t1 = __a - 4.0f;
-  __ffloat __t2 = __a + 4.0f;
-  __t2          = __ffloat(1.0) / __t2;
-  __ffloat __t3 = (__t1 * __t2);
-  __ffloat __t4 = __t3 + 1.0f;
-  __t1          = (__t4 * -4.0f + __a);
-  __t1          = __t1 - __t3 * __a;
-  __t2          = (__t2 * __t1 + __t3);
+  const float __a_hi = __a.hi();
+  const float __a_lo = __a.lo();
 
-  // Chebyshev polynomial: 7 high-order terms in float, remaining 16 in ff
-  __t1 = ::cuda::__fpmp_poly_eval<__fpmp_poly_method::horner_mixed, 7>(__t2, __cheb);
+  /* rho = 1 / (a + 4) as the pair r + r_lo. With den = a + 4 as a pair and r = fl(1 / den_hi),
+   * e = 1 - den * r (1 - den_hi * r is exact in the fma) gives 1 / den = r * (1 + e + e^2 + ...);
+   * |e| is about 2^-23, so the series stops at e^2. s = 4 * rho and w = a * rho both inherit the
+   * relative error of rho; taking w as 1 - s instead would turn a relative error d of s into
+   * an absolute error 4 * d of a, which is 4.5 * d in erfc(a) near a = 0. */
+  float __den_lo;
+  const float __den_hi = ::cuda::__fpmp_two_sum(__a_hi, 4.0f, &__den_lo);
+  __den_lo             = ::cuda::__fpmp_add_rn(__den_lo, __a_lo);
+  const float __r      = ::cuda::__fpmp_rcp_rn(__den_hi);
+  float __e            = ::cuda::__fpmp_fma_rn(-__den_hi, __r, 1.0f);
+  __e                  = ::cuda::__fpmp_fma_rn(-__den_lo, __r, __e);
+  const float __r_lo   = ::cuda::__fpmp_mul_rn(__r, ::cuda::__fpmp_fma_rn(__e, __e, __e));
+  const __ffloat __s(4.0f * __r, 4.0f * __r_lo);
+  float __w_lo;
+  const float __w_hi = ::cuda::__fpmp_two_mult_fma(__a_hi, __r, &__w_lo);
+  __w_lo = ::cuda::__fpmp_add_rn(__w_lo, ::cuda::__fpmp_fma_rn(__a_hi, __r_lo, ::cuda::__fpmp_mul_rn(__a_lo, __r)));
 
-  /* (1+2*a)*exp(a^2)*erfc(a) / (1+2*a) -> exp(a^2)*erfc(a) = erfcx */
-  __t2 = (__a * 2.0f + 1.0f);
-  __t2 = __ffloat(1.0) / __t2;
-  __t3 = __t1 * __t2;
-  __t4 = __a * (__t3 * -2.0f) + __t1;
-  __t4 = (__t4 - __t3);
-  __t1 = (__t4 * __t2 + __t3);
+  /* v = 7/16 - w, renormalized: the high limbs cancel near w = 7/16. */
+  float __dif_lo;
+  const float __dif_hi = ::cuda::__fpmp_two_sum(0.4375f, -__w_hi, &__dif_lo);
+  float __v_lo;
+  const float __v_hi = ::cuda::__fpmp_two_sum(__dif_hi, ::cuda::__fpmp_sub_rn(__dif_lo, __w_lo), &__v_lo);
+  const __ffloat __v(__v_hi, __v_lo);
+
+  // erfcx(a) = s * R(v): 3 high-order terms in float, the remaining 16 compensated
+  const __ffloat __erfcx = ::cuda::__fpmp_poly_eval<__fpmp_poly_method::horner_comp, 3>(__v, __r_c) * __s;
 
   /* erfc(x) = erfcx * exp(-a^2), with -a^2 = z + i * ln 2. a^2 is taken exactly, as
    * a_hi^2 = p_hi + p_lo and 2 a_hi a_lo = q_hi + q_lo plus a_lo^2, and ln 2 as L1 + L2 + L3
@@ -490,8 +490,6 @@ __internal_fpmp2_erfc(const float __x_hi, const float __x_lo, float* __res_hi, f
    * Sterbenz's lemma. The other terms are at most |i * L2| or 2^-22 * a^2 and are summed as
    * a pair before the leading one, which leaves z with an absolute error of about u^2;
    * rounding -a^2 to a pair first costs about u^2 * a^2. */
-  const float __a_hi = __a.hi();
-  const float __a_lo = __a.lo();
   float __p_lo;
   const float __p_hi = ::cuda::__fpmp_two_mult_fma(__a_hi, __a_hi, &__p_lo);
   float __q_lo;
@@ -509,26 +507,16 @@ __internal_fpmp2_erfc(const float __x_hi, const float __x_lo, float* __res_hi, f
   __ffloat __z       = renormalize(__m + ::cuda::__fpmp_fma_rn(-__t_rint, __ln2_1, -__p_hi));
 
   // exp polynomial: 5 high-order terms in float, remaining 7 in ff
-  __ffloat __t = ::cuda::__fpmp_poly_eval<__fpmp_poly_method::horner_mixed, 5>(__z, __exp_c);
+  const __ffloat __exp_z = ::cuda::__fpmp_poly_eval<__fpmp_poly_method::horner_mixed, 5>(__z, __exp_c);
 
-  /* accurate_scale(t, i): t * 2^i in fp32mp2 (split exponent for large |i|)*/
-  int __k   = __i / 2;
-  int __ek  = 127 + __k;
-  int __ek2 = 127 + (__i - __k);
-  if (__ek < 1)
-  {
-    __ek = 1;
-  }
-  if (__ek2 < 1)
-  {
-    __ek2 = 1;
-  }
-
-  float __scale_lo      = ::cuda::std::bit_cast<float>(static_cast<unsigned>(__ek) << 23);
-  float __scale_hi      = ::cuda::std::bit_cast<float>(static_cast<unsigned>(__ek2) << 23);
-  __ffloat __exp_scaled = __ffloat(__t.hi() * __scale_lo * __scale_hi, __t.lo() * __scale_lo * __scale_hi);
-
-  __ffloat __erfc_val = renormalize(__t1 * __exp_scaled);
+  /* erfc(a) = erfcx(a) * exp(z) * 2^i. The two O(1) factors are multiplied first and the
+   * product is scaled in two steps: a <= 10.0546875 gives -146 <= i <= 0, so both powers of
+   * two are normal and the high limb rounds at most once, into the subnormal range. */
+  const __ffloat __prod = renormalize(__erfcx * __exp_z);
+  const int __k         = __i / 2;
+  const float __scale_1 = ::cuda::std::bit_cast<float>(static_cast<unsigned>(127 + __k) << 23);
+  const float __scale_2 = ::cuda::std::bit_cast<float>(static_cast<unsigned>(127 + (__i - __k)) << 23);
+  __ffloat __erfc_val   = __ffloat(__prod.hi() * __scale_1 * __scale_2, __prod.lo() * __scale_1 * __scale_2);
 
   if (__is_neg)
   {
