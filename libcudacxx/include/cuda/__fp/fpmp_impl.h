@@ -624,7 +624,7 @@ _CCCL_TRIVIAL_HOST_DEVICE_API float __fpmp_rsqrt_rn(float __x) noexcept
 // number; h only needs a few bits more than half of a limb. The host takes the correctly
 // rounded square root, the device a single-limb Newton step on its approximate reciprocal
 // square root. A zero a gives y = h = 0.
-_CCCL_TRIVIAL_HOST_DEVICE_API float __fpmp_sqrt_seed(const float __a, float* __h) noexcept
+_CCCL_HOST_DEVICE_API _CCCL_FORCEINLINE float __fpmp_sqrt_seed(const float __a, float* __h) noexcept
 {
   float __y;
   NV_IF_ELSE_TARGET(
@@ -837,7 +837,7 @@ _CCCL_TRIVIAL_HOST_DEVICE_API double __fpmp_rsqrt_rn(double __x) noexcept
 }
 // The double-precision seed of the fpmp2 square root kernel: as above, the device taking its
 // reciprocal square root as it is.
-_CCCL_TRIVIAL_HOST_DEVICE_API double __fpmp_sqrt_seed(const double __a, double* __h) noexcept
+_CCCL_HOST_DEVICE_API _CCCL_FORCEINLINE double __fpmp_sqrt_seed(const double __a, double* __h) noexcept
 {
   double __y;
   NV_IF_ELSE_TARGET(
