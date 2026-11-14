@@ -54,12 +54,13 @@ Conventions
   does so, and shown where the source keeps them.
 - Host and device run the same operation sequences, and differ only in the seed that starts
   the ``div`` and ``sqrt`` iterations: for ``fp32mp2`` the device uses the approximate
-  reciprocal and reciprocal-square-root instructions and the host an exact division; for
-  ``fp64mp2`` both reciprocals are correctly rounded, while the device's reciprocal square root
-  is close to correctly rounded and the host's ``1/sqrt(x)`` carries two roundings. One Newton
-  step leaves about ``(3/2)·ε²`` of a seed error ``ε``, which at double-word precision is
-  visible: a 1u seed leaves 1.5u², a 1.5u seed 3.4u², a 2u seed 6.5u². Where the sides differ,
-  the tables quote the device.
+  reciprocal and reciprocal-square-root instructions and the host an exact division and the
+  correctly rounded square root; for ``fp64mp2`` both reciprocals are correctly rounded, while
+  the device's reciprocal square root is close to correctly rounded and the host's
+  ``1/sqrt(x)`` carries two roundings. One Newton step leaves about ``(3/2)·ε²`` of a seed
+  error ``ε``, which at double-word precision is visible: a 1u seed leaves 1.5u², a 1.5u seed
+  3.4u², a 2u seed 6.5u². ``sqrt`` and ``rsqrt`` add the second-order term of their step, which
+  removes that floor. Where the sides differ, the tables quote the device.
 
 The bounds
 ----------
@@ -185,8 +186,8 @@ host against binary128 — whichever of the two is larger.
      - —
      - measured
      - ``x > 0``
-     - 9.5
-     - 2.9 [#seed]_
+     - 0.5
+     - 1.9 [#seed]_
 
 .. [#host] Measured on the host against an exact reference, the error accumulated from
    error-free transforms, over ``5·10⁷`` normalized operand pairs from random and structured
@@ -195,11 +196,11 @@ host against binary128 — whichever of the two is larger.
    relative error of these operations is unbounded (next section); their absolute error stays
    within the stated absolute bound — the largest observed is in the
    :ref:`regime table <libcudacxx-extended-api-fp-fpmp-error-bounds-regimes>` below.
-.. [#seed] Measured on the device against binary128 over 2\ :sup:`22` operands spanning 80
-   binades, with the host run on the same operands for comparison (5.8): the host's
-   two-rounding ``1/sqrt(x)`` seed costs it the difference, as the seed floor in *Conventions*
-   predicts. The specification's own ``fp64mp2`` table reports a smaller maximum for ``sqrt``
-   over its working range.
+.. [#seed] Measured against MPFR over 2\ :sup:`20` (``fp32mp2``) and 2\ :sup:`18`
+   (``fp64mp2``) operands in each of six ranges that together span the type, subnormal operands
+   included, on the host and on the device. The ``fp64mp2`` figure is the device's, which takes
+   its reciprocal square root as the seed without refining it; the host stays within 0.5.
+   ``rsqrt(x)`` stays within 2.7 on the host and 3.9 on the device.
 
 ``low`` and ``mid`` addition, ``low`` and ``mid`` ``fma``, and ``low`` and ``mid``
 multiplication by a one-limb scalar compute the *same value*; the normalizing level additionally normalizes it, which is exact, so they share a bound

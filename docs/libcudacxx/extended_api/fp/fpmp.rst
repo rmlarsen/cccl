@@ -378,6 +378,8 @@ hardware where FP64 is rationed:
   ``log10``, ``log1p``
 - **Powers and roots** — ``pow``, ``cbrt``, ``rcbrt``, alongside the ``sqrt`` and ``rsqrt``
   already named above
+- **Distances and norms** — ``hypot``, ``rhypot``, ``norm3d``, ``norm4d``, ``rnorm3d``,
+  ``rnorm4d``, for ``fp64mp2`` as well, where they carry both limbs
 - **Trigonometric** — ``sin``, ``cos``, ``tan``, ``sincos``, ``asin``, ``acos``, ``atan``,
   ``atan2``, and the pi-scaled ``sinpi``, ``cospi``, ``sincospi``, which split the argument over
   the limb pair rather than reducing it against a radian multiple of pi
@@ -385,8 +387,8 @@ hardware where FP64 is rationed:
 - **Error functions** — ``erf``, ``erfc``
 - **Rounding, magnitude and scaling** — ``ceil``, ``floor``, ``trunc``, ``round``, ``fabs``,
   ``ldexp``, ``scalbn``
-- **Minimum, maximum and remainder** — ``fmin``, ``fmax``, ``min``, ``max``, ``fmod``,
-  ``remainder``
+- **Minimum, maximum, difference and remainder** — ``fmin``, ``fmax``, ``min``, ``max``,
+  ``fdim``, ``fmod``, ``remainder``
 - **Probability** — ``normcdfinv``, and ``icdf`` for ``fp32mp2`` only, which turns a 32- or 64-bit
   uniform integer into a Gaussian variate. Taking an integer rather than a pair, it is the one
   function here that ADL cannot find, so it has to be written ``cuda::icdf(bits)``, and its
@@ -396,10 +398,9 @@ hardware where FP64 is rationed:
 The remaining names are present with the same signatures, but implemented generically rather than
 through a dedicated float-float path: ``erfinv``, ``erfcinv``, ``erfcx``, ``normcdf``, ``tgamma``,
 ``lgamma``, the Bessel family ``j0``, ``j1``, ``jn``, ``y0``, ``y1``, ``yn``, ``cyl_bessel_i0``
-and ``cyl_bessel_i1``, the distances ``hypot`` and ``rhypot``, the vector norms ``norm3d``,
-``norm4d``, ``rnorm3d`` and ``rnorm4d``, ``rint``, ``nearbyint``, ``lrint``, ``lround``,
-``llrint``, ``llround``, ``copysign``, ``scalbln``, ``frexp``, ``modf``, ``logb``, ``ilogb``,
-``nextafter``, ``fdim``, ``remquo``, and the classification predicates. For the exact ones among
+and ``cyl_bessel_i1``, ``rint``, ``nearbyint``, ``lrint``, ``lround``, ``llrint``, ``llround``,
+``copysign``, ``scalbln``, ``frexp``, ``modf``, ``logb``, ``ilogb``, ``nextafter``, ``remquo``,
+and the classification predicates. For the exact ones among
 these — the rounding, sign and decomposition family — that costs nothing, since an exact operation
 is exact however it is written; for the transcendentals it means evaluation through the backend
 covered in the next section.

@@ -134,7 +134,7 @@
     - fmin(x,y) : Minimum - dedicated fp32mp2 optimization (lexicographic compare on (hi, lo), NaN-aware)
     - max(x,y)  : Maximum - dedicated fp32mp2 optimization (std::max-like, first-arg tie/unordered behavior)
     - min(x,y)  : Minimum - dedicated fp32mp2 optimization (std::min-like, first-arg tie/unordered behavior)
-    - fdim(x,y) : Positive difference - placeholder
+    - fdim(x,y) : Positive difference - dedicated fp32mp2 and fp64mp2 (accurate pair subtraction)
 
     Remainder:
     - fmod(x,y) : Floating-point remainder - dedicated fp32mp2
@@ -142,14 +142,14 @@
     - remquo(x,y,*q): Remainder with quotient bits - placeholder
 
     Distance:
-    - hypot(x,y): Hypotenuse sqrt(x^2+y^2) - placeholder
-    - rhypot(x,y): Reciprocal hypotenuse - placeholder (host: 1/hypot)
+    - hypot(x,y): Hypotenuse sqrt(x^2+y^2) - dedicated fp32mp2 and fp64mp2
+    - rhypot(x,y): Reciprocal hypotenuse - dedicated fp32mp2 and fp64mp2
 
     Vector Norms:
-    - norm3d(a,b,c)    : 3D Euclidean norm sqrt(a^2+b^2+c^2) - placeholder
-    - norm4d(a,b,c,d)  : 4D Euclidean norm sqrt(a^2+b^2+c^2+d^2) - placeholder
-    - rnorm3d(a,b,c)   : Reciprocal 3D norm - placeholder
-    - rnorm4d(a,b,c,d) : Reciprocal 4D norm - placeholder
+    - norm3d(a,b,c)    : 3D Euclidean norm sqrt(a^2+b^2+c^2) - dedicated fp32mp2 and fp64mp2
+    - norm4d(a,b,c,d)  : 4D Euclidean norm sqrt(a^2+b^2+c^2+d^2) - dedicated fp32mp2 and fp64mp2
+    - rnorm3d(a,b,c)   : Reciprocal 3D norm - dedicated fp32mp2 and fp64mp2
+    - rnorm4d(a,b,c,d) : Reciprocal 4D norm - dedicated fp32mp2 and fp64mp2
 
     Classification (portable prefixed API + conditional standard overloads):
     - fpmp_isfinite(x): Test for finite value - placeholder
@@ -222,6 +222,19 @@
       that the lo-limb ulp accumulation in the (x^2+1)/(x-1)(x+1) chain
       doesn't degrade precision, and the dropped 1/(4x^2) correction
       sits below fp32mp2 ulp throughout the asymptotic region.
+
+    hypot, rhypot, norm3d, norm4d, rnorm3d, rnorm4d for fp32mp2 and fp64mp2:
+      One kernel for the Euclidean norm of 2, 3 or 4 pairs and its
+      reciprocal.  The operands are scaled by a power of two taken from
+      the largest high limb, so that no square overflows or loses its
+      rounding error to underflow; the squares are formed and summed as
+      pairs, and the sum goes through the pair square root, or the pair
+      reciprocal square root.  No double-precision arithmetic is used
+      for fp32mp2, and fp64mp2 results carry both limbs.
+      Accuracy against MPFR: see fpmp_math_impl_pow.h.
+      Special cases: an infinite operand gives +inf (+0 for the
+      reciprocal) even next to a NaN, otherwise NaN->NaN; all operands
+      zero give +0 (+inf); overflow gives +inf.
 
     ldexp(x, n) for fp32mp2:
       result = x * 2^n built directly in fp32 via bit-cast of the
