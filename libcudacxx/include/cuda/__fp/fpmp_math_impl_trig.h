@@ -540,9 +540,16 @@ struct alignas(8) __fpmp2_atan_entry
   float __lo;
 };
 
-// Rounded from 400-bit values (Sollya). Hidden, like the functions that read it, so that
-// shared libraries built against different versions of this table do not share one copy.
-_CCCL_VISIBILITY_HIDDEN _CCCL_GLOBAL_CONSTANT __fpmp2_atan_entry __fpmp2_atan_table[5][17] = {
+// Rounded from 400-bit values (Sollya). Hidden in host code, like the functions that read
+// it, so that shared libraries built against different versions of this table do not share
+// one copy. The device pass takes no visibility: without RDC the table has internal linkage
+// there, where nvcc rejects the attribute.
+#  if _CCCL_DEVICE_COMPILATION() && !_CCCL_CUDA_COMPILER(NVHPC)
+#    define _CCCL_FPMP_ATAN_TABLE _CCCL_GLOBAL_CONSTANT
+#  else // ^^^ device pass ^^^ / vvv host code vvv
+#    define _CCCL_FPMP_ATAN_TABLE _CCCL_VISIBILITY_HIDDEN _CCCL_GLOBAL_CONSTANT
+#  endif // ^^^ host code ^^^
+_CCCL_FPMP_ATAN_TABLE __fpmp2_atan_entry __fpmp2_atan_table[5][17] = {
   // atan(i/16)
   {
     {0.0f, 0.0f},
@@ -644,6 +651,7 @@ _CCCL_VISIBILITY_HIDDEN _CCCL_GLOBAL_CONSTANT __fpmp2_atan_entry __fpmp2_atan_ta
     {0x1.6a09e6p-1f, 0x1.9fcef4p-27f},
   },
 };
+#  undef _CCCL_FPMP_ATAN_TABLE
 
 /*
  * atan(m / M) for pairs 0 <= m <= M (to within rounding), M normal, folded into `__row` of
